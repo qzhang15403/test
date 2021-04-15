@@ -1,0 +1,672 @@
+#### UI
+
+library(shinydashboard)
+
+
+header <- dashboardHeader(
+  title = "FENICS UST Downloadable tools",
+  titleWidth = 300
+)
+
+sidebar <- dashboardSidebar(
+  width = 300,
+  tags$body(class="hold-transition skin-blue sidebar-collapse sidebar-mini"),
+  sidebarMenu(
+    menuItemOutput("priceLevelSide"),
+    menuItemOutput('tradeSearchTabSide')
+  )
+)
+body <- dashboardBody(
+  uiOutput("sudologin")
+  
+)
+
+ui <- dashboardPage(header,sidebar,body)
+
+
+#### server
+
+library(shinydashboard)
+library(chron)
+library(DT)
+library(openxlsx)
+#source("/appl/shiny/r/qserver.R")
+library(rkdb)
+
+holidays<-as.chron(as.Date(c("2017-08-04","2017-09-04","2017-10-09","2017-11-23",
+                             "2017-12-25",
+                             "2018-01-01","2018-01-15","2018-02-19","2018-03-30",
+                             "2018-05-28","2018-07-04","2018-09-03","2018-10-08",
+                             "2018-11-12", "2018-11-22","2018-12-05",
+                             "2018-12-25","2019-01-01","2019-01-21",
+                             "2019-02-18","2019-04-19","2019-05-27","2019-07-04",
+                             "2019-09-02","2019-11-28","2019-12-25","2020-01-01",
+                             "2020-01-20","2020-02-17","2020-04-10","2020-05-25",
+                             "2020-07-03","2020-09-07","2020-11-26","2020-12-25"
+)))
+
+firmtb<-read.csv("./firm.csv")
+
+#firmtb<-read.csv("H:/backup/priceLevelAnalysis/firm.csv")
+firms<-sort(as.character(firmtb$originatingTradingFirm))
+options(digits=12)
+server <- function(input,output,session) {
+  
+  #### build up each tab's body
+  
+  output$sudologin <- renderUI({
+    fluidPage(
+      fluidRow(uiOutput("priceLevelBody")),
+      fluidRow(uiOutput("tradeSearchTabBody"))
+    )
+    
+  })
+  
+  
+  ####### Trades PriceLevel Analysis components
+  
+  ### pricelevel analysis tool sidebar
+  output$priceLevelSide <- renderMenu({
+    sidebarMenu(
+      menuItem("Trades PriceLevel Analysis",tabName = "pricelevels", icon = icon("table"),
+               fluidRow(
+                 column(12,dateRangeInput("pricelevelsdates","Date Range",
+                                          start=as.Date(paste0(substr(Sys.Date(),1,8),"01")),
+                                          end=Sys.Date()-1,max=Sys.Date(),min="2017-08-03"))
+               ),
+               fluidRow(
+                 column(12,selectInput("pricelevelsfrm","Firm",c("ALL",firms),multiple=T,selected="ALL"))
+               ),
+               fluidRow(
+                 column(12,selectInput("pricelevelsPool","CLOB/BLOCK",c("ALL","CLOB","BLOCK")))
+               ),
+               fluidRow(
+                 column(12,selectInput("pricelevelsAP","A/P",c("ALL","Aggressive","Passive")))
+               ),
+               fluidRow(
+                 column(4,actionButton("pricelevelsrun","Run")),
+                 column(5,uiOutput("pricelevelsTabrunUI"))
+               ))
+    )
+  })
+  ### pricelevel analysis tool body UI
+  observeEvent(input$pricelevelsrun,{
+    
+    ### remove other tabs' bodies
+    ## remove tradeSearchTabBody
+    output$tradeSearchTabBody <- renderUI({
+      NULL
+    })
+    
+    output$pricelevelsTabrunUI <- renderUI({
+      downloadButton("pricelevelsTabDownload","download")
+    })
+    
+    output$priceLevelBody <- renderUI({
+      fluidPage(
+        fluidRow(
+          uiOutput("pricelevelsreport")
+        )
+      )
+      
+    })
+    
+    
+    ### get dates
+    priceleveldays <- eventReactive(input$pricelevelsrun,{
+      if(input$pricelevelsdates[2]>input$pricelevelsdates[1]){
+        sdate<-input$pricelevelsdates[1]
+        edate<-input$pricelevelsdates[2]
+      } else {
+        sdate<-input$pricelevelsdates[2]
+        edate<-input$pricelevelsdates[1]
+      }
+      alldays<-seq(sdate,edate,by="day")  
+      is.workday <- !is.holiday(alldays,holidays)&!is.weekend(alldays)
+      alldays<-alldays[is.workday]
+    })	
+    
+    
+    ####get pricelevel data from local
+    stdtb <- expand.grid("tr"=list("02Y","03Y","05Y","07Y","10Y","30Y"),"prices"=c(0,2,4,8,16))
+    stdtb <- as.data.frame(lapply(stdtb,unlist))
+    pricelevelsdata <- eventReactive(input$pricelevelsrun,{
+      restb <- data.frame()
+      restblst <- list()
+      withProgress(message = "loading data", value = 0, {	
+        for (i in 1:length(priceleveldays())) {
+          resdt <- strftime(priceleveldays()[i],"%Y.%m.%d")
+          #restblst[[i]] <- read.csv(sprintf("h:/backup/%s.csv",resdt),header=TRUE,sep=",")
+          #restblst[[i]] <- read.csv(sprintf("/srv/shiny-server/apps/visuals/priceLevelAnalysis/data/%s.csv",resdt),header=TRUE,sep=",")
+          restblst[[i]] <- read.csv(sprintf("./%s.csv",resdt),header=TRUE,sep=",")
+          
+          incProgress(1/length(priceleveldays()), detail = paste("Day",i))
+        }
+      })
+      for (i in 1:length(priceleveldays())) {
+        restb <- rbind(restb,restblst[[i]])
+      }
+      ## firm filter
+      if (length(input$pricelevelsfrm)==1) {
+        
+        if (input$pricelevelsfrm=="ALL") {
+          NULL
+        } else {
+          restb <- restb[which(restb$firm==input$pricelevelsfrm),] 
+        }
+      } else {
+        restb <- restb[which(restb$firm %in% input$pricelevelsfrm),]
+      }
+      ## Pool filter    
+      if (input$pricelevelsPool=="ALL") {
+        NULL
+      } else if (input$pricelevelsPool=="CLOB") {
+        restb <- restb[which(restb$pool=="CLOB"),]
+      } else {
+        restb <- restb[which(restb$pool=="BLOCK"),]
+      }
+      
+      ## AP filter
+      if (input$pricelevelsAP=="ALL") {
+        NULL
+      } else if (input$pricelevelsAP=="Aggressive") {
+        restb <- restb[which(restb$AP=="A"),]
+      } else {
+        restb <- restb[which(restb$AP=="P"),]
+      }
+      
+      if (0==length(restb$vol)) {
+        restb <- data.frame(cbind(stdtb,"vol"=0))
+      } else {
+        NULL
+      }
+      
+      if(length(input$pricelevelsfrm)==1 & input$pricelevelsfrm=="ALL" & input$pricelevelsAP=="ALL") {
+        restb <- aggregate(restb$vol/2,list(restb$tr,restb$prices),sum)
+      } else {
+        restb <- aggregate(restb$vol,list(restb$tr,restb$prices),sum)
+      }
+      colnames(restb) <- c("tr","prices","vol")
+      restb <- merge(stdtb,restb,c("tr","prices"),all.x=TRUE)
+      restb$vol[is.na(restb$vol)] <- 0
+      resmt <- matrix(restb$vol,ncol=length(unique(restb$tr)))
+      colnames(resmt) <- unique(restb$tr)
+      resmt <- data.frame(cbind("prices"=unique(restb$prices),resmt))
+      resmt <- resmt[order(resmt$prices),]
+      resmt$total <- rowSums(resmt[,2:7])
+      resmt<-rbind(resmt,c("total",colSums(resmt[,2:8])))
+      for (i in 2:8) {
+        resmt[,i] <- as.numeric(resmt[,i])
+      }
+      return(resmt)
+      
+    })
+    ####prepare pricelevel data 
+    pricelevelsvoldata <- eventReactive(input$pricelevelsrun,{
+      res <- pricelevelsdata()
+      return(res)
+    })
+    pricelevelspercentdata <- eventReactive(input$pricelevelsrun,{
+      res <- pricelevelsdata()
+      dividend <- res[6,8]
+      res[1,] <- 0
+      res[2,] <- 0
+      res[3,2] <- 0
+      res[3,3] <- 0
+      res[3,4] <- 0
+      res[4,2] <- 0
+      for (i in 1:5){
+        res[i,8] <- sum(res[i,2:7])
+      }
+      for (i in 2:7){
+        res[,i] <- res[,i]/res[6,i]
+      }
+      for (i in 2:7){
+        res[6,i] <- sum(res[1:5,i])
+      }
+      for (i in 3:5){
+        res[i,8] <- res[i,8]/dividend
+      }
+      res[6,8] <- sum(res[3:5,8])
+      res[is.na(res)] <- 0
+      return(res)
+    })
+    
+    pricelevelssavingsdata <- eventReactive(input$pricelevelsrun,{
+      res <- pricelevelsdata()
+      res[3,5:7] <- round(res[3,5:7]*19.53125*4,2)
+      res[4,3:7] <- round(res[4,3:7]*19.53125*2,2)
+      res[5,2:7] <- round(res[5,2:7]*19.53125,2)
+      res[3,8] <- sum(res[3,5:7])
+      res[4,8] <- sum(res[4,3:7])
+      res[5,8] <- sum(res[5,2:7])
+      res[6,2] <- sum(res[5,2])
+      res[6,3] <- sum(res[4:5,3])
+      res[6,4] <- sum(res[4:5,4])
+      res[6,5] <- sum(res[3:5,5])
+      res[6,6] <- sum(res[3:5,6])
+      res[6,7] <- sum(res[3:5,7])
+      res[6,8] <- sum(res[3:5,8])
+      res[,2:8] <- round(res[,2:8],2)
+      return(res)
+    })
+    
+    #### define display components in shiny
+    output$pricelevelsreport <- renderUI({
+      fluidPage(
+        #fluidRow(
+        # div(style = "font-size: 15px; padding-left: 0px; padding-bottom: 10px; padding-top: 15px; padding-right:0px",
+        #    htmlOutput("pricelevelsdes")
+        #   )
+        # ),
+        fluidRow(
+          div(style = "font-size: 15px; padding-left: 0px; padding-bottom: 10px; padding-top: 15px; padding-right:0px",
+              htmlOutput("priceleveltitle")
+          )
+        ),
+        fluidRow(
+          div(style = "font-size: 15px; padding-left: 0px; padding-bottom: 10px; padding-top: 15px; padding-right:0px",
+              htmlOutput("pricelevelspercent")
+              #DT::dataTableOutput("pricelevelspercent")
+          )
+        ),
+        fluidRow(
+          div(style = "font-size: 15px; padding-left: 0px; padding-bottom: 10px; padding-top: 15px; padding-right:0px",
+              htmlOutput("pricelevelsvol")
+              #DT::dataTableOutput("pricelevelsvol")
+          )
+        ),
+        fluidRow(
+          div(style = "font-size: 15px; padding-left: 0px; padding-bottom: 10px; padding-top: 15px; padding-right:0px",
+              htmlOutput("pricelevelssavings")
+              #DT::dataTableOutput("pricelevelssavings")
+          )
+        )
+      )
+      
+      
+    })
+    #### display messages to check
+    #output$pricelevelsdes <- eventReactive(input$pricelevelsrun,{
+    #paste("input is:",input$pricelevelsfrm,pricelevelsdt(),sep=" ")
+    # src <- normalizePath("pricelevel.Rmd")
+    
+    
+    # })
+    #### create price level title
+    pricelevelfrmformat <- eventReactive(input$pricelevelsrun,{
+      res <- input$pricelevelsfrm
+      if ("ALL" %in% res & !length(res)==1) {
+        res <- res[!res %in% "ALL"]
+      } else {
+        NULL
+      }
+      if (length(res)==1) {
+        res
+      } else {
+        paste0(length(res)," firms")
+      }
+      
+    })
+    priceleveldtformat <- eventReactive(input$pricelevelsrun,{
+      if(input$pricelevelsdates[2]>input$pricelevelsdates[1]){
+        sdate<-input$pricelevelsdates[1]
+        edate<-input$pricelevelsdates[2]
+      } else {
+        sdate<-input$pricelevelsdates[2]
+        edate<-input$pricelevelsdates[1]
+      }
+      alldays<-seq(sdate,edate,by="day")  
+      is.workday <- !is.holiday(alldays,holidays)&!is.weekend(alldays)
+      alldays<-alldays[is.workday]
+      if (length(alldays)==1) {
+        return(alldays[1])
+      } else {
+        return(paste0("( ",alldays[1]," - ",tail(alldays,1)," )"))
+      }
+    }) 
+    
+    output$priceleveltitle <- renderUI({
+      
+      res <- HTML(
+        paste0(sprintf(includeText(path="rmd/www/priceleveltitle.txt"),
+                       paste0("FENICS UST "," - Price Levels Analysis - ",
+                              pricelevelfrmformat(),priceleveldtformat()))))
+      return(res)
+      
+    })
+    
+    #### pricelevel percent component
+    output$pricelevelspercent <- renderUI({
+      res<-pricelevelspercentdata()
+      for (i in 2:8) {
+        res[,i] <- sprintf("%.1f%%",res[,i]*100)
+      }
+      res1<-HTML(
+        paste0(sprintf(includeText(path="rmd/www/pricelevelpercent.txt"),
+                       res[3,5],res[3,6],res[3,7],res[3,8],
+                       res[4,3],res[4,4],res[4,5],res[4,6],res[4,7],res[4,8],
+                       res[5,2],res[5,3],res[5,4],res[5,5],res[5,6],res[5,7],res[5,8],
+                       res[6,2],res[6,3],res[6,4],res[6,5],res[6,6],res[6,7],res[6,8])
+        )
+      )
+      return(res1)
+    })
+    #### pricelevel 
+    output$pricelevelsvol <- renderUI({
+      res<-pricelevelsvoldata()
+      res[,2:8] <- format(res[,2:8],big.mark = ",",small.mark = ",",small.interval = 3)
+      
+      res1<-HTML(
+        paste0(sprintf(includeText(path="rmd/www/pricelevelvol.txt"),
+                       res[1,2],res[1,3],res[1,4],res[1,5],res[1,6],res[1,7],res[1,8],
+                       res[2,2],res[2,3],res[2,4],res[2,5],res[2,6],res[2,7],res[2,8],
+                       res[3,2],res[3,3],res[3,4],res[3,5],res[3,6],res[3,7],res[3,8],
+                       res[4,2],res[4,3],res[4,4],res[4,5],res[4,6],res[4,7],res[4,8],
+                       res[5,2],res[5,3],res[5,4],res[5,5],res[5,6],res[5,7],res[5,8],
+                       res[6,2],res[6,3],res[6,4],res[6,5],res[6,6],res[6,7],res[6,8])
+        )
+      )
+      return(res1)
+      
+    })
+    output$pricelevelssavings <- renderUI({
+      res<-pricelevelssavingsdata()
+      res[,2:8] <- format(res[,2:8],nsmall = 2,big.mark = ",",small.mark = ",",small.interval = 3)
+      res1<-HTML(
+        paste0(sprintf(includeText(path="rmd/www/pricelevelsavings.txt"),
+                       res[3,5],res[3,6],res[3,7],res[3,8],
+                       res[4,3],res[4,4],res[4,5],res[4,6],res[4,7],res[4,8],
+                       res[5,2],res[5,3],res[5,4],res[5,5],res[5,6],res[5,7],res[5,8],
+                       res[6,2],res[6,3],res[6,4],res[6,5],res[6,6],res[6,7],res[6,8])
+        )
+      )
+      return(res1)
+    })
+    
+    output$pricelevelsTabDownload <- downloadHandler(
+      filename=function(){
+        paste0("FenicsPriceLevels","_",pricelevelfrmformat(),"_",priceleveldtformat(),".xlsx")
+        
+      },
+      content = function(file) {
+        respercent<-pricelevelspercentdata()
+        respercent[1:2,] <- NA
+        respercent[3,2:4] <- NA
+        respercent[4,2] <- NA
+        
+        options(java.parameters = "-Xmx8024m")
+        wb <- createWorkbook()
+        addWorksheet(wb,"PriceLevelsAnalysis")
+        ###add fixed cell values & pictures
+        colhead <- data.frame("x"=c("Whole 1/32","1/2 of 1/32","1/4 of 1/32","1/8 of 1/32","1/16 of 1/32"))
+        rowhead <- data.frame("02YR","03YR","05YR","07YR","10YR","30YR","Grand Total")
+        writeData(wb,1,"FENICS UST - Price Levels Analysis",startRow = 2)
+        
+        ## write data into sheet
+        writeData(wb,1,respercent[,2:8],startRow = 5,startCol = 2, colNames = FALSE,keepNA = FALSE)
+        writeData(wb,1,pricelevelsvoldata()[,2:8],startRow = 13, startCol = 2, colNames = FALSE)
+        writeData(wb,1,pricelevelssavingsdata()[,2:8],startRow = 21,startCol = 2,colNames = FALSE,keepNA = FALSE)
+        writeData(wb,1,colhead,startRow = 5, startCol = 1,colNames = FALSE)
+        writeData(wb,1,colhead,startRow = 13, startCol = 1,colNames = FALSE)
+        writeData(wb,1,colhead,startRow = 21, startCol = 1,colNames = FALSE)
+ 
+        writeData(wb,1,paste0(pricelevelfrmformat(),priceleveldtformat()),startRow = 3)
+        writeData(wb,1,"Percentage",startRow = 4,startCol = 1)
+        writeData(wb,1, "Volume", startRow = 12, startCol = 1)
+        writeData(wb,1, "Cost Savings",startRow = 20, startCol = 1)
+        writeData(wb,1,"Fenics Only Pricing",startRow = 10,startCol = 1)
+        writeData(wb,1,"Fenics Volume",startRow = 18,startCol = 1)
+        writeData(wb,1,"Fenics Only Pricing",startRow = 26,startCol = 1)
+        writeData(wb,1,rowhead,startRow=4,startCol = 2,colNames = FALSE)
+        writeData(wb,1,rowhead,startRow=12,startCol = 2,colNames = FALSE)
+        writeData(wb,1,rowhead,startRow=20,startCol = 2,colNames = FALSE)
+        mergeCells(wb,1,cols=1:8,rows=2)
+        mergeCells(wb,1,cols=1:8,rows=3)
+        insertImage(wb,1,"./images.png",startRow = 27,startCol = 1,width=3, height = 1)
+        
+        ##create style
+        csbold <- createStyle(textDecoration = c("bold"))
+        csheader <- createStyle(fontSize = 18,fgFill = "#000000",fontColour = "#ffffff",halign = "center")
+        cscolorg <- createStyle(fgFill="#c0c0c0")
+        cscolory1 <- createStyle(fgFill="#ffff00")
+        cscolory2 <- createStyle(fgFill="#ffff99")
+        cscolory3 <- createStyle(fgFill="#ffffcc")
+        cscolorb1 <- createStyle(fgFill="#2f75b5")
+        cscolorb2 <- createStyle(fgFill="#9bc2e6")
+        cscolorb3 <- createStyle(fgFill="#ddebf7")
+        cscolorg1 <- createStyle(fgFill="#00b050")
+        cscolorg2 <- createStyle(fgFill="#92d050")
+        cscolorg3 <- createStyle(fgFill="#e2efda")
+        csnumfmt1 <- createStyle(numFmt = "0.0%")
+        csnumfmt2 <- createStyle(numFmt = "#,##0")
+        csnumfmt3 <- createStyle(numFmt = "$ #,##0.00")
+        csborder1 <- createStyle(border = "Bottom")
+        csborder2 <- createStyle(border = "Top")
+        csborder3 <- createStyle(border = "Right")
+        csborder4 <- createStyle(border = "Left")
+        csaligh <- createStyle(halign = "right")
+        csfontcolor <- createStyle(fontColour = "#ffffff")
+        csfont <- createStyle(fontName = "Cambria")
+        
+        ##format cells
+        ##add bold
+        addStyle(wb,1,style=csbold,rows=c(4,10,12,18,20,26),cols=1:8,gridExpand = TRUE,stack = TRUE)
+        addStyle(wb,1,style=csbold,rows=c(5:9,13:17,21:25),cols=c(c(1,8),c(1,8),c(1,8)),gridExpand = TRUE,stack = TRUE)
+        addStyle(wb,1,style=csbold,rows=2:3,cols=1,gridExpand = TRUE)
+        ##add fills
+        addStyle(wb,1,style=csheader ,rows=2:3,cols=1,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolory1, rows=c(4,10), cols=c(1,8),gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorb1, rows=c(12,18), cols=c(1,8),gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorg1, rows=c(20,26), cols=c(1,8),gridExpand = TRUE)
+        addStyle(wb,1,style=cscolory2, rows=c(4,10), cols=2:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolory2, rows=7:9, cols=8,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorb2, rows=c(12,18), cols=2:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorb2, rows=15:17, cols=8,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorg2, rows=c(20,26), cols=2:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorg2, rows=23:25, cols=8,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolory3, rows=9, cols =2:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolory3, rows=8, cols =3:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolory3, rows=7, cols =5:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorb3, rows=17, cols =2:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorb3, rows=16, cols =3:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorb3, rows=15, cols =5:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorb3, rows=25, cols =2:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorb3, rows=24, cols =3:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorb3, rows=23, cols =5:7,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorg, rows=c(5,6,13,14,21,22), cols=2:8,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorg, rows=c(7,15,23), cols=2:4,gridExpand = TRUE)
+        addStyle(wb,1,style=cscolorg, rows=c(8,16,24), cols=2,gridExpand = TRUE)
+        ## add number format
+        addStyle(wb,1,style=csnumfmt1,rows=5:10,cols=2:8,gridExpand = TRUE, stack = TRUE)
+        addStyle(wb,1,style=csnumfmt2,rows=13:18,cols=2:8,gridExpand = TRUE, stack = TRUE)
+        addStyle(wb,1,style=csnumfmt3,rows=21:26,cols=2:8,gridExpand = TRUE, stack = TRUE)
+        ## format width
+        setColWidths(wb,1,cols=1,widths = 20)
+        setColWidths(wb,1,cols=8,widths = 17)
+        setColWidths(wb,1,cols=2:7,widths = 13)
+        ## add border
+        addStyle(wb,1,style=csborder1,rows=c(4,12,20),cols=1:8,gridExpand = TRUE,stack = TRUE)
+        addStyle(wb,1,style=csborder2,rows=c(10,18,26),cols=1:8,gridExpand = TRUE,stack = TRUE)
+        addStyle(wb,1,style=csborder3,rows=c(4:10,12:18,20:26),cols=1,gridExpand = TRUE,stack = TRUE)
+        addStyle(wb,1,style=csborder4,rows=c(4:10,12:18,20:26),cols=8,gridExpand = TRUE,stack = TRUE)
+        ## alighment
+        addStyle(wb,1,style=csaligh,row=c(4,12,20),cols=8,gridExpand = TRUE,stack = TRUE)
+        ## change font 
+        addStyle(wb,1,style = csfont, rows = 2:26,cols=1:8,gridExpand = TRUE,stack = TRUE)
+        addStyle(wb,1,style = csfontcolor, rows = c(12,18,20,26), cols = c(1,8), gridExpand = TRUE, stack = TRUE)
+        
+        withProgress(message = "Downloading...", value = 0, {
+          saveWorkbook(wb,file)
+        })
+      }
+    )
+    
+    
+    
+  })
+  
+  
+  
+  ####### Trades Search components
+  
+  ### Trades Search tool sidebar
+  output$tradeSearchTabSide <- renderMenu({
+    sidebarMenu(
+      menuItem("Trades Search",tabName = "tradeSearchTab", icon = icon("table"),
+               fluidRow(
+                 column(12,dateRangeInput("tradeSearchTabdates","Date Range",
+                                          start=Sys.Date()-2,
+                                          end=Sys.Date()-1,max=Sys.Date(),min="2018-01-01"))
+               ),
+               fluidRow(
+                 column(12,selectInput("tradeSearchTabfrm","Firm",c("ALL",firms),multiple=T,selected="ALL"))
+               ),
+               fluidRow(
+                 column(12,selectInput("tradeSearchTabPool","CLOB/BLOCK",c("ALL","CLOB","BLOCK")))
+               ),
+               fluidRow(
+                 column(12,selectInput("tradeSearchTabAP","A/P",c("ALL","Aggressive","Passive")))
+               ),
+               fluidRow(
+                 column(4,actionButton("tradeSearchTabrun","Run")),
+                 column(5,uiOutput("tradeSearchTabrunUI"))
+               ))
+    )
+  })
+  
+  ### Trades Search tool body UI
+  observeEvent(input$tradeSearchTabrun,{
+    ### remove other tabs' bodies
+    ## remove tradeSearchTabBody
+    output$priceLevelBody <- renderUI({
+      NULL
+    })
+    
+    
+    output$tradeSearchTabrunUI <- renderUI({
+      downloadButton("tradeSearchTabDownload","download")
+    })
+    output$tradeSearchTabBody <- renderUI({
+      fluidPage(
+        fluidRow(
+          DT::dataTableOutput("tradeSearchTabTable")
+        )
+      )
+      
+    })
+    
+    ### get trades search dates
+    tradeSearchTabdays <- eventReactive(input$tradeSearchTabrun,{
+      if(input$tradeSearchTabdates[2]>input$tradeSearchTabdates[1]){
+        sdate<-input$tradeSearchTabdates[1]
+        edate<-input$tradeSearchTabdates[2]
+      } else {
+        sdate<-input$tradeSearchTabdates[2]
+        edate<-input$tradeSearchTabdates[1]
+      }
+      alldays<-seq(sdate,edate,by="day")  
+      is.workday <- !is.holiday(alldays,holidays)&!is.weekend(alldays)
+      alldays<-alldays[is.workday]
+    })
+    
+    tradeSearchTbdata <- eventReactive(input$tradeSearchTabrun,{
+      restb <- data.frame()
+      restblst <- list()
+      h <- open_connection("nyustkdbg-p1",15027,"shinyClient:shinyClient")
+      withProgress(message = "loading data", value = 0, {	
+        for (i in 1:length(tradeSearchTabdays())) {
+          resdt <- strftime(tradeSearchTabdays()[i],"%Y.%m.%d")
+          string <- sprintf("update pool:?[instrument like \"FENICS UST *\";`CLOB;`BLOCK] from select date:%s,UTCTime:string time,side,AP,instrument,firm,trader,qty%%1000000,tradedPrice,settlePrice,commission from getTradesForDate[%s]",resdt,resdt)
+          restblst[[i]] <- execute(h,string)
+          incProgress(1/length(tradeSearchTabdays()), detail = paste("Day",i,"out of  ",length(tradeSearchTabdays())))
+        }
+      })
+      for (i in 1:length(tradeSearchTabdays())) {
+        restb <- rbind(restb,restblst[[i]])
+      }
+      close_connection(h)
+      return(restb)
+    })
+    
+    tradeSearchTbdatares <- reactive({
+      restb <- tradeSearchTbdata()
+      ## firm filter
+      if (length(input$tradeSearchTabfrm)==1) {
+        
+        if (input$tradeSearchTabfrm=="ALL") {
+          NULL
+        } else {
+          restb <- restb[which(restb$firm==input$tradeSearchTabfrm),] 
+        }
+      } else {
+        restb <- restb[which(restb$firm %in% input$tradeSearchTabfrm),]
+      }
+      ## Pool filter    
+      if (input$tradeSearchTabPool=="ALL") {
+        NULL
+      } else if (input$tradeSearchTabPool=="CLOB") {
+        restb <- restb[which(restb$pool=="CLOB"),]
+      } else {
+        restb <- restb[which(restb$pool=="BLOCK"),]
+      }
+      ## AP filter
+      if (input$tradeSearchTabAP=="ALL") {
+        NULL
+      } else if (input$tradeSearchTabAP=="Aggressive") {
+        restb <- restb[which(restb$AP=="A"),]
+      } else {
+        restb <- restb[which(restb$AP=="P"),]
+      }
+      
+      return(restb)
+    })
+    
+    output$tradeSearchTabTable <- DT::renderDataTable({ 
+      restb <- tradeSearchTbdatares()
+      datatable(
+        restb,
+        class = 'cell-boarder stripe',
+        rownames = FALSE,
+        options = list(
+          dom =  '<"top"Bfl>rt<"bottom"ip><"clear">',
+          initComplete = JS(
+            "function(settings, json) {",
+            "$(this.api().table().header()).css({'background-color': '#000', 'color': '#fff'});",
+            "}"),
+          #class="display",
+          lengthMenu = list( c(5, 10, 75, -1) # declare values
+                             , c(5, 10, 75, "All")), 
+          pageLength = 5,
+          scrollX =T
+        ) 
+      )
+    })
+    output$tradeSearchTabDownload <- downloadHandler(
+      filename=function(){
+        if(length(tradeSearchTabdays())==1) {
+          paste0("trades",tradeSearchTabdays(),".xlsx")
+        } else {
+          paste0("trades",head(tradeSearchTabdays(),1),"-",tail(tradeSearchTabdays(),1),".xlsx",sep="")
+        }
+        
+      },
+      
+      content = function(file) {
+        options(java.parameters = "-Xmx8024m") 
+        wb <- createWorkbook()
+        addWorksheet(wb, "FUSTTrades")
+        writeData(wb,1,tradeSearchTbdatares())
+        withProgress(message = "Downloading...", value = 0, {
+          saveWorkbook(wb,file)
+        })
+        
+      }
+      
+    )
+    
+  })
+}
+
+
+
